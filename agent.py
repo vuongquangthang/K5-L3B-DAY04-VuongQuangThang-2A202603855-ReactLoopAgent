@@ -1,6 +1,7 @@
 """Agent loop cho bài lab điều tra status."""
 
 import json
+import time
 from status_tools import SCHEMAS
 
 SYSTEM_PROMPT = '''Bạn là trợ lý điều tra trạng thái GitHub và Cloudflare.
@@ -40,6 +41,8 @@ def run_agent(question, provider, tools, max_steps=6):
     trace = []
     usage = []
     observed_sources = set()
+    retry_counts = {}
+    pending_retries = {}
     answer = ''
     step = 0
 
@@ -78,6 +81,7 @@ def run_agent(question, provider, tools, max_steps=6):
             call_id = call.get('id')
             name = call.get('name')
             raw_arguments = call.get('arguments', '')
+            arguments = None
             try:
                 arguments = json.loads(raw_arguments)
                 if not isinstance(arguments, dict):
@@ -94,6 +98,13 @@ def run_agent(question, provider, tools, max_steps=6):
 
             if isinstance(result, dict) and result.get('ok') and result.get('url'):
                 observed_sources.add(result['url'])
+            retry_key = (name, json.dumps(arguments if isinstance(arguments, dict) else raw_arguments,
+                                          sort_keys=True, ensure_ascii=False))
+            if isinstance(result, dict) and result.get('error') == 'RATE_LIMITED':
+                retry_counts[retry_key] = retry_counts.get(retry_key, 0) + 1
+                pending_retries[retry_key] = (call_id, name, arguments)
+            elif isinstance(result, dict) and not result.get('error'):
+                pending_retries.pop(retry_key, None)
             trace.append({'event': 'tool', 'step': step, 'name': name,
                           'arguments': raw_arguments, 'result': result})
             messages.append({
@@ -110,6 +121,43 @@ def run_agent(question, provider, tools, max_steps=6):
                           'error': 'MODEL_STOPPED_UNEXPECTEDLY', 'finish': finish})
             return {'status': 'error', 'answer': answer, 'trace': trace,
                     'usage': usage, 'error': f'Model dừng với lý do: {finish}'}
+
+        if pending_retries:
+            retry_key, (call_id, name, arguments) = next(iter(pending_retries.items()))
+            if retry_counts[retry_key] < 3:
+                retry_after = 0
+                previous = trace[-1].get('result') if trace and trace[-1].get('event') == 'tool' else {}
+                try:
+                    retry_after = float(previous.get('retry_after_seconds') or previous.get('retry_after') or 0)
+                except (TypeError, ValueError):
+                    retry_after = 0
+                if retry_after > 0:
+                    time.sleep(min(retry_after, 2))
+                retry_result = tools.execute(name, arguments)
+                retry_counts[retry_key] += 1
+                if isinstance(retry_result, dict) and not retry_result.get('error'):
+                    pending_retries.pop(retry_key, None)
+                else:
+                    pending_retries[retry_key] = (call_id, name, arguments)
+                retry_call = {
+                    'id': f'{call_id}-retry-{retry_counts[retry_key]}',
+                    'type': 'function',
+                    'function': {
+                        'name': name,
+                        'arguments': json.dumps(arguments, ensure_ascii=False),
+                    },
+                }
+                messages.append({'role': 'assistant', 'content': None,
+                                 'tool_calls': [retry_call]})
+                messages.append({
+                    'role': 'tool',
+                    'tool_call_id': retry_call['id'],
+                    'content': json.dumps(retry_result, ensure_ascii=False),
+                })
+                trace.append({'event': 'tool', 'step': step, 'name': name,
+                              'arguments': json.dumps(arguments, ensure_ascii=False),
+                              'result': retry_result, 'retry': True})
+                continue
 
         if observed_sources and not any(source in answer for source in observed_sources):
             trace.append({'event': 'validation_missing_source', 'step': step,
