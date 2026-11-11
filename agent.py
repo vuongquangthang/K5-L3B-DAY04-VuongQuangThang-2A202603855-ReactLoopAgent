@@ -26,6 +26,16 @@ QUY TẮC ĐIỀU TRA BẮT BUỘC:
    người dùng hỏi, và không bịa nguyên nhân, component, khu vực hoặc URL nguồn.'''
 
 
+def _observation_for_model(result, tools):
+    """Return a bounded observation without mutating the raw tool result."""
+    if not isinstance(result, dict) or not getattr(tools, 'schemas', None):
+        return result
+    cleaned = dict(result)
+    cleaned.pop('distractors', None)
+    cleaned.pop('external_notice', None)
+    return cleaned
+
+
 def run_agent(question, provider, tools, max_steps=6):
     """Trả dict: status, answer, trace, usage. Contract chi tiết trong GUIDE.md."""
     if not isinstance(max_steps, int) or max_steps < 1:
@@ -110,7 +120,8 @@ def run_agent(question, provider, tools, max_steps=6):
             messages.append({
                 'role': 'tool',
                 'tool_call_id': call_id,
-                'content': json.dumps(result, ensure_ascii=False),
+                'content': json.dumps(_observation_for_model(result, tools),
+                                      ensure_ascii=False),
             })
 
         if calls:
@@ -135,6 +146,8 @@ def run_agent(question, provider, tools, max_steps=6):
                     time.sleep(min(retry_after, 2))
                 retry_result = tools.execute(name, arguments)
                 retry_counts[retry_key] += 1
+                if isinstance(retry_result, dict) and retry_result.get('ok') and retry_result.get('url'):
+                    observed_sources.add(retry_result['url'])
                 if isinstance(retry_result, dict) and not retry_result.get('error'):
                     pending_retries.pop(retry_key, None)
                 else:
@@ -152,7 +165,8 @@ def run_agent(question, provider, tools, max_steps=6):
                 messages.append({
                     'role': 'tool',
                     'tool_call_id': retry_call['id'],
-                    'content': json.dumps(retry_result, ensure_ascii=False),
+                    'content': json.dumps(_observation_for_model(retry_result, tools),
+                                          ensure_ascii=False),
                 })
                 trace.append({'event': 'tool', 'step': step, 'name': name,
                               'arguments': json.dumps(arguments, ensure_ascii=False),
